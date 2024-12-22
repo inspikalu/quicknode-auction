@@ -1,243 +1,195 @@
 import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
-import { EnhancedAuction } from "../target/types/enhanced_auction";
-import { PublicKey, SystemProgram, SYSVAR_RENT_PUBKEY } from "@solana/web3.js";
-import { 
-  TOKEN_PROGRAM_ID, 
-  ASSOCIATED_TOKEN_PROGRAM_ID,
-  createMint,
-  createAssociatedTokenAccount,
-  mintTo
-} from "@solana/spl-token";
-import { assert } from "chai";
+import assert from "assert";
+import { AuctionSystem } from "../target/types/auction_system";
 
-describe("enhanced_auction", () => {
+// Utility function for creating keypairs
+const createKeypair = async (): Promise<anchor.web3.Keypair> => {
+  const keypair = anchor.web3.Keypair.generate();
+  return keypair;
+};
+
+describe("Auction System Tests", () => {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
 
-  const program = anchor.workspace.EnhancedAuction as Program<EnhancedAuction>;
-  
-  let nftMint: PublicKey;
-  let creatorNftAccount: PublicKey;
-  let vaultNftAccount: PublicKey;
-  let auction: anchor.web3.Keypair;
-  let creator: anchor.web3.Keypair;
+  const program = anchor.workspace.AuctionSystem as Program<AuctionSystem>;
+
+  // Accounts
+  let auctionAccount: anchor.web3.Keypair;
+  let nftMint: anchor.web3.Keypair;
+  let nftVault: anchor.web3.PublicKey;
   let bidder: anchor.web3.Keypair;
-  let winnerNftAccount: PublicKey;
-  let auctionAuthority: PublicKey;
-  let auctionAuthorityBump: number;
-  let escrowAccount: PublicKey;
-  let escrowBump: number;
+  let creator: anchor.web3.Keypair;
 
   before(async () => {
-    creator = anchor.web3.Keypair.generate();
-    bidder = anchor.web3.Keypair.generate();
-    auction = anchor.web3.Keypair.generate();
+    // Initialize keypairs
+    auctionAccount = await createKeypair();
+    nftMint = await createKeypair();
+    creator = await createKeypair();
+    bidder = await createKeypair();
 
     // Airdrop SOL to creator and bidder
-    await provider.connection.requestAirdrop(creator.publicKey, 10 * anchor.web3.LAMPORTS_PER_SOL);
-    await provider.connection.requestAirdrop(bidder.publicKey, 10 * anchor.web3.LAMPORTS_PER_SOL);
-
-    // Create NFT mint
-    nftMint = await createMint(
-      provider.connection,
-      creator,
+    const airdropTx1 = await provider.connection.requestAirdrop(
       creator.publicKey,
-      null,
-      0
+      anchor.web3.LAMPORTS_PER_SOL * 2
     );
-
-    // Create token accounts
-    creatorNftAccount = await createAssociatedTokenAccount(
-      provider.connection,
-      creator,
-      nftMint,
-      creator.publicKey
+    const airdropTx2 = await provider.connection.requestAirdrop(
+      bidder.publicKey,
+      anchor.web3.LAMPORTS_PER_SOL * 2
     );
+    await provider.connection.confirmTransaction(airdropTx1);
+    await provider.connection.confirmTransaction(airdropTx2);
+  });
 
-    // Mint NFT to creator
-    await mintTo(
-      provider.connection,
-      creator,
-      nftMint,
-      creatorNftAccount,
-      creator,
-      1
-    );
-
-    // Derive PDAs
-    [auctionAuthority, auctionAuthorityBump] = await PublicKey.findProgramAddress(
-      [Buffer.from("auction"), auction.publicKey.toBuffer()],
+  it("Initializes an auction", async () => {
+    nftVault = await anchor.web3.PublicKey.findProgramAddress(
+      [Buffer.from("vault"), auctionAccount.publicKey.toBuffer()],
       program.programId
-    );
+    ).then(([address]) => address);
 
-    [escrowAccount, escrowBump] = await PublicKey.findProgramAddress(
-      [Buffer.from("escrow"), auction.publicKey.toBuffer()],
-      program.programId
-    );
+    await program.methods
+      .initializeAuction(
+        new anchor.BN(anchor.web3.LAMPORTS_PER_SOL / 10), // Starting bid
+        new anchor.BN(anchor.web3.LAMPORTS_PER_SOL / 20), // Minimum increment
+        new anchor.BN(60 * 60) // Auction duration
+      )
+      .accounts({
+        auction: auctionAccount.publicKey,
+        creator: creator.publicKey,
+        vaultNftAccount: nftVault,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .signers([auctionAccount, creator])
+      .rpc();
 
-    // Create winner's token account
-    winnerNftAccount = await createAssociatedTokenAccount(
-      provider.connection,
-      bidder,
-      nftMint,
-      bidder.publicKey
+    const auctionState = await program.account.auction.fetch(
+      auctionAccount.publicKey
     );
+    assert.strictEqual(auctionState.creator.toBase58(), creator.publicKey.toBase58());
+    assert.strictEqual(auctionState.status.active, true);
+  });
 
-    vaultNftAccount = await createAssociatedTokenAccount(
-      provider.connection,
-      creator,
-      nftMint,
-      auctionAuthority,
-      true
+  it("Places a valid bid", async () => {
+    await program.methods
+      .placeBid(new anchor.BN(anchor.web3.LAMPORTS_PER_SOL / 2))
+      .accounts({
+        auction: auctionAccount.publicKey,
+        bidder: bidder.publicKey,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .signers([bidder])
+      .rpc();
+
+    const auctionState = await program.account.auction.fetch(
+      auctionAccount.publicKey
+    );
+    assert.strictEqual(auctionState.highestBidder.toBase58(), bidder.publicKey.toBase58());
+    assert.strictEqual(
+      auctionState.highestBid.toNumber(),
+      anchor.web3.LAMPORTS_PER_SOL / 2
     );
   });
 
-  describe("Initialize Auction", () => {
-    it("Successfully initializes auction", async () => {
+  it("Fails to place a bid lower than the current highest bid", async () => {
+    try {
       await program.methods
-        .initializeAuction(
-          new anchor.BN(1_000_000), // 1 SOL starting bid
-          new anchor.BN(100_000),   // 0.1 SOL min increment
-          new anchor.BN(3600)       // 1 hour duration
-        )
+        .placeBid(new anchor.BN(anchor.web3.LAMPORTS_PER_SOL / 4))
         .accounts({
-          auction: auction.publicKey,
-          creator: creator.publicKey,
-          nftMint: nftMint,
-          creatorNftAccount: creatorNftAccount,
-          vaultNftAccount: vaultNftAccount,
-          systemProgram: SystemProgram.programId,
-          tokenProgram: TOKEN_PROGRAM_ID,
-          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-          rent: SYSVAR_RENT_PUBKEY,
-        })
-        .signers([auction, creator])
-        .rpc();
-
-      const auctionAccount = await program.account.auction.fetch(auction.publicKey);
-      assert.equal(auctionAccount.creator.toString(), creator.publicKey.toString());
-      assert.equal(auctionAccount.status.active !== undefined, true);
-    });
-
-    it("Fails with invalid duration", async () => {
-      const newAuction = anchor.web3.Keypair.generate();
-      try {
-        await program.methods
-          .initializeAuction(
-            new anchor.BN(1_000_000),
-            new anchor.BN(100_000),
-            new anchor.BN(0) // Invalid duration
-          )
-          .accounts({
-            auction: newAuction.publicKey,
-            creator: creator.publicKey,
-            nftMint: nftMint,
-            creatorNftAccount: creatorNftAccount,
-            vaultNftAccount: vaultNftAccount,
-            systemProgram: SystemProgram.programId,
-            tokenProgram: TOKEN_PROGRAM_ID,
-            associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-            rent: SYSVAR_RENT_PUBKEY,
-          })
-          .signers([newAuction, creator])
-          .rpc();
-        assert.fail("Should have failed with invalid duration");
-      } catch (err) {
-        assert.include(err.message, "InvalidDuration");
-      }
-    });
-  });
-
-  describe("Place Bid", () => {
-    it("Successfully places first bid", async () => {
-      await program.methods
-        .placeBid(new anchor.BN(1_500_000))
-        .accounts({
-          auction: auction.publicKey,
+          auction: auctionAccount.publicKey,
           bidder: bidder.publicKey,
-          previousBidder: SystemProgram.programId, // No previous bidder
-          auctionEscrow: escrowAccount,
-          systemProgram: SystemProgram.programId,
+          systemProgram: anchor.web3.SystemProgram.programId,
         })
         .signers([bidder])
         .rpc();
-
-      const auctionAccount = await program.account.auction.fetch(auction.publicKey);
-      assert.equal(auctionAccount.highestBid.toString(), "1500000");
-      assert.equal(auctionAccount.highestBidder.toString(), bidder.publicKey.toString());
-    });
-
-    it("Fails with bid below minimum increment", async () => {
-      const newBidder = anchor.web3.Keypair.generate();
-      await provider.connection.requestAirdrop(newBidder.publicKey, 2 * anchor.web3.LAMPORTS_PER_SOL);
-
-      try {
-        await program.methods
-          .placeBid(new anchor.BN(1_550_000)) // Below minimum increment
-          .accounts({
-            auction: auction.publicKey,
-            bidder: newBidder.publicKey,
-            previousBidder: bidder.publicKey,
-            auctionEscrow: escrowAccount,
-            systemProgram: SystemProgram.programId,
-          })
-          .signers([newBidder])
-          .rpc();
-        assert.fail("Should have failed with bid increment too low");
-      } catch (err) {
-        assert.include(err.message, "BidIncrementTooLow");
-      }
-    });
+      assert.fail("Bid should not have succeeded");
+    } catch (err) {
+      assert.match(err.message, /Bid must exceed current highest bid/);
+    }
   });
 
-  describe("Finalize Auction", () => {
-    it("Fails to finalize before end time", async () => {
-      try {
-        await program.methods
-          .finalizeAuction()
-          .accounts({
-            auction: auction.publicKey,
-            creator: creator.publicKey,
-            auctionAuthority: auctionAuthority,
-            vaultNftAccount: vaultNftAccount,
-            winnerNftAccount: winnerNftAccount,
-            auctionEscrow: escrowAccount,
-            platformFeeAccount: provider.wallet.publicKey,
-            tokenProgram: TOKEN_PROGRAM_ID,
-            systemProgram: SystemProgram.programId,
-          })
-          .rpc();
-        assert.fail("Should have failed with auction not ended");
-      } catch (err) {
-        assert.include(err.message, "AuctionNotEnded");
-      }
-    });
+  it("Finalizes the auction", async () => {
+    await program.methods
+      .finalizeAuction()
+      .accounts({
+        auction: auctionAccount.publicKey,
+        creator: creator.publicKey,
+        vaultNftAccount: nftVault,
+        highestBidder: bidder.publicKey,
+      })
+      .signers([creator])
+      .rpc();
 
-    // Add more test cases for successful finalization after auction ends
+    const auctionState = await program.account.auction.fetch(
+      auctionAccount.publicKey
+    );
+    assert.strictEqual(auctionState.status.completed, true);
   });
 
-  describe("Cancel Auction", () => {
-    it("Fails to cancel auction with bids", async () => {
-      try {
-        await program.methods
-          .cancelAuction()
-          .accounts({
-            auction: auction.publicKey,
-            creator: creator.publicKey,
-            auctionAuthority: auctionAuthority,
-            vaultNftAccount: vaultNftAccount,
-            creatorNftAccount: creatorNftAccount,
-            tokenProgram: TOKEN_PROGRAM_ID,
-          })
-          .signers([creator])
-          .rpc();
-        assert.fail("Should have failed with auction has bids");
-      } catch (err) {
-        assert.include(err.message, "AuctionHasBids");
-      }
-    });
+  it("Fails to finalize an already completed auction", async () => {
+    try {
+      await program.methods
+        .finalizeAuction()
+        .accounts({
+          auction: auctionAccount.publicKey,
+          creator: creator.publicKey,
+          vaultNftAccount: nftVault,
+          highestBidder: bidder.publicKey,
+        })
+        .signers([creator])
+        .rpc();
+      assert.fail("Finalization should not have succeeded");
+    } catch (err) {
+      assert.match(err.message, /Auction is already completed/);
+    }
   });
 
-  // Add more test cases for other instructions
+  it("Withdraws an unsold NFT", async () => {
+    await program.methods
+      .withdrawUnsoldNft()
+      .accounts({
+        auction: auctionAccount.publicKey,
+        creator: creator.publicKey,
+        vaultNftAccount: nftVault,
+      })
+      .signers([creator])
+      .rpc();
+
+    const auctionState = await program.account.auction.fetch(
+      auctionAccount.publicKey
+    );
+    assert.strictEqual(auctionState.status.cancelled, true);
+  });
+
+  it("Cancels an auction before any bids are placed", async () => {
+    const newAuction = await createKeypair();
+    await program.methods
+      .initializeAuction(
+        new anchor.BN(anchor.web3.LAMPORTS_PER_SOL / 10),
+        new anchor.BN(anchor.web3.LAMPORTS_PER_SOL / 20),
+        new anchor.BN(60 * 60)
+      )
+      .accounts({
+        auction: newAuction.publicKey,
+        creator: creator.publicKey,
+        vaultNftAccount: nftVault,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .signers([newAuction, creator])
+      .rpc();
+
+    await program.methods
+      .cancelAuction()
+      .accounts({
+        auction: newAuction.publicKey,
+        creator: creator.publicKey,
+      })
+      .signers([creator])
+      .rpc();
+
+    const auctionState = await program.account.auction.fetch(
+      newAuction.publicKey
+    );
+    assert.strictEqual(auctionState.status.cancelled, true);
+  });
 });
